@@ -1,185 +1,158 @@
 package erbrenderer
 
 const templateEvaluationContextRb = `
-# Based on common/properties/template_evaluation_context.rb
-require "rubygems"
-require "ostruct"
-require "json"
-require "erb"
-require "yaml"
+require 'ostruct'
+require 'bosh/template/evaluation_failed'
+require 'bosh/template/unknown_property'
+require 'bosh/template/unknown_link'
+require 'bosh/template/property_helper'
 
-class Hash
-  def recursive_merge!(other)
-    self.merge!(other) do |_, old_value, new_value|
-      if old_value.class == Hash && new_value.class == Hash
-        old_value.recursive_merge!(new_value)
-      else
-        new_value
+module Bosh
+  module Template
+    # Helper class to evaluate templates. Used by Director, CLI and Agent.
+    class EvaluationContext
+      include PropertyHelper
+
+      # @return [String] Template name
+      attr_reader :name
+
+      # @return [Integer] Template instance index
+      attr_reader :index
+
+      # @return [Hash] Template properties
+      attr_reader :properties
+
+      # @return [Hash] Raw template properties (no openstruct)
+      attr_reader :raw_properties
+
+      # @return [Hash] Template spec
+      attr_reader :spec
+
+      # @param [Hash] spec Template spec
+      def initialize(spec)
+        unless spec.is_a?(Hash)
+          raise EvaluationFailed,
+                'Invalid spec provided for template evaluation context, ' +
+                    "Hash expected, #{spec.class} given"
+        end
+
+        if spec['job'].is_a?(Hash)
+          @name = spec['job']['name']
+        else
+          @name = nil
+        end
+
+        @index = spec['index']
+        @spec = openstruct(spec)
+        @raw_properties = spec['properties'] || {}
+        @properties = openstruct(@raw_properties)
+
+        @links = spec['links'] || {}
+      end
+
+      # @return [Binding] Template binding
+      def get_binding
+        binding.taint
+      end
+
+      # Property lookup helper
+      #
+      # @overload p(name, default_value)
+      #   Returns property value or default value if property not set
+      #   @param [String] name Property name
+      #   @param [Object] default_value Default value
+      #   @return [Object] Property value
+      #
+      # @overload p(names, default_value)
+      #   Returns first property from the list that is set or default value if
+      #   none of them are set
+      #   @param [Array<String>] names Property names
+      #   @param [Object] default_value Default value
+      #   @return [Object] Property value
+      #
+      # @overload p(names)
+      #   Looks up first property from the list that is set, raises an error
+      #   if none of them are set.
+      #   @param [Array<String>] names Property names
+      #   @return [Object] Property value
+      #   @raise [Bosh::Common::UnknownProperty]
+      #
+      # @overload p(name)
+      #   Looks up property and raises an error if it's not set
+      #   @param [String] name Property name
+      #   @return [Object] Property value
+      #   @raise [Bosh::Common::UnknownProperty]
+      def p(*args)
+        names = Array(args[0])
+
+        names.each do |name|
+          result = lookup_property(@raw_properties, name)
+          return result unless result.nil?
+        end
+
+        return args[1] if args.length == 2
+        raise UnknownProperty.new(names)
+      end
+
+      def link(name)
+        result = lookup_property(@links, name)
+        return result unless result.nil?
+
+        raise UnknownLink.new(name)
+      end
+
+      # Run a block of code if all given properties are defined
+      # @param [Array<String>] names Property names
+      # @yield [Object] property values
+      def if_p(*names)
+        values = names.map do |name|
+          value = lookup_property(@raw_properties, name)
+          return ActiveElseBlock.new(self) if value.nil?
+          value
+        end
+
+        yield *values
+        InactiveElseBlock.new
+      end
+
+      # @return [Object] Object representation where all hashes are unrolled
+      #   into OpenStruct objects. This exists mostly for backward
+      #   compatibility, as it doesn't provide good error reporting.
+      def openstruct(object)
+        case object
+          when Hash
+            mapped = object.inject({}) { |h, (k, v)| h[k] = openstruct(v); h }
+            OpenStruct.new(mapped)
+          when Array
+            object.map { |item| openstruct(item) }
+          else
+            object
+        end
+      end
+
+      class ActiveElseBlock
+        def initialize(template_context)
+          @context = template_context
+        end
+
+        def else
+          yield
+        end
+
+        def else_if_p(*names, &block)
+          @context.if_p(*names, &block)
+        end
+      end
+
+      class InactiveElseBlock
+        def else
+        end
+
+        def else_if_p(*names)
+          InactiveElseBlock.new
+        end
       end
     end
-    self
-  end
-end
-
-class TemplateEvaluationContext
-  attr_reader :name, :index
-  attr_reader :properties, :raw_properties
-  attr_reader :spec
-
-  def initialize(spec)
-    @name = spec["job"]["name"] if spec["job"].is_a?(Hash)
-    @index = spec["index"]
-
-    properties1 = spec['global_properties'].recursive_merge!(spec['cluster_properties'])
-    properties = {}
-    spec['default_properties'].each do |name, value|
-      copy_property(properties, properties1, name, value)
-    end
-
-    @properties = openstruct(properties)
-    @raw_properties = properties
-    @spec = openstruct(spec)
-  end
-
-  def get_binding
-    binding.taint
-  end
-
-  def p(*args)
-    names = Array(args[0])
-
-    names.each do |name|
-      result = lookup_property(@raw_properties, name)
-      return result unless result.nil?
-    end
-
-    return args[1] if args.length == 2
-    raise UnknownProperty.new(names)
-  end
-
-  def if_p(*names)
-    values = names.map do |name|
-      value = lookup_property(@raw_properties, name)
-      return ActiveElseBlock.new(self) if value.nil?
-      value
-    end
-
-    yield *values
-    InactiveElseBlock.new
-  end
-
-  private
-
-  def copy_property(dst, src, name, default = nil)
-    keys = name.split(".")
-    src_ref = src
-    dst_ref = dst
-
-    keys.each do |key|
-      src_ref = src_ref[key]
-      break if src_ref.nil? # no property with this name is src
-    end
-
-    keys[0..-2].each do |key|
-      dst_ref[key] ||= {}
-      dst_ref = dst_ref[key]
-    end
-
-    dst_ref[keys[-1]] ||= {}
-    dst_ref[keys[-1]] = src_ref.nil? ? default : src_ref
-  end
-
-  def openstruct(object)
-    case object
-      when Hash
-        mapped = object.inject({}) { |h, (k,v)| h[k] = openstruct(v); h }
-        OpenStruct.new(mapped)
-      when Array
-        object.map { |item| openstruct(item) }
-      else
-        object
-    end
-  end
-
-  def lookup_property(collection, name)
-    keys = name.split(".")
-    ref = collection
-
-    keys.each do |key|
-      ref = ref[key]
-      return nil if ref.nil?
-    end
-
-    ref
-  end
-
-  class UnknownProperty < StandardError
-    attr_reader :name
-
-    def initialize(names)
-      @names = names
-      super("Can't find property '#{names.join("', or '")}'")
-    end
-  end
-
-  class ActiveElseBlock
-    def initialize(template)
-      @context = template
-    end
-
-    def else
-      yield
-    end
-
-    def else_if_p(*names, &block)
-      @context.if_p(*names, &block)
-    end
-  end
-
-  class InactiveElseBlock
-    def else; end
-
-    def else_if_p(*names)
-      InactiveElseBlock.new
-    end
-  end
-end
-
-# todo do not use JSON in releases
-class << JSON
-  alias dump_array_or_hash dump
-
-  def dump(*args)
-    arg = args[0]
-    if arg.is_a?(String) || arg.is_a?(Numeric)
-      arg.inspect
-    else
-      dump_array_or_hash(*args)
-    end
-  end
-end
-
-class ERBRenderer
-  def initialize(context)
-    @context = context
-  end
-
-  def render(src_path, dst_path)
-    erb = ERB.new(File.read(src_path))
-    erb.filename = src_path
-
-    File.open(dst_path, "w") do |f|
-      f.write(erb.result(@context.get_binding))
-    end
-
-  rescue Exception => e
-    name = "#{@context.name}/#{@context.index}"
-
-    line_i = e.backtrace.index { |l| l.include?(erb.filename) }
-    line_num = line_i ? e.backtrace[line_i].split(':')[1] : "unknown"
-    location = "(line #{line_num}: #{e.inspect})"
-
-    raise("Error filling in template '#{src_path}' for #{name} #{location}")
   end
 end
 
@@ -192,4 +165,5 @@ if $0 == __FILE__
   renderer = ERBRenderer.new(context)
   renderer.render(src_path, dst_path)
 end
+
 `
